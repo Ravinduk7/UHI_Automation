@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import branca.colormap as cm
 import io
 import base64
+import numpy as np
 
 # --- UI SETUP ---
 st.set_page_config(page_title="Urban Heat Island Architect", layout="wide")
@@ -25,7 +26,7 @@ if "user_polygon" not in st.session_state:
 
 
 st.title("🏙️ Urban Heat Island Automation Tool")
-st.markdown("Draw a boundary and select a year to identify local hotspots.")
+st.markdown("Automated Land Surface Temperature (LST) extraction using Landsat Thermal Infrared Sensor (TIRS) data.")
 
 # --- SIDEBAR INPUTS ---
 with st.sidebar:
@@ -44,12 +45,24 @@ st.subheader("1. Define your Area of Interest")
 # Initialize the map with dynamic camera!
 m = folium.Map(location=st.session_state.map_center, zoom_start=st.session_state.map_zoom)
 
+# --- STAT DASHBOARD ---
+if st.session_state.layers:
+    st.subheader("📊 Latest UHI Statistics")
+    latest_stats = st.session_state.layers[-1]["stats"]
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Maximum Temp", f"{latest_stats['max']:.1f} °C")
+    col2.metric("Average Temp", f"{latest_stats['mean']:.1f} °C")
+    col3.metric("Minimum Temp", f"{latest_stats['min']:.1f} °C")
+    col4.metric("UHI Threshold", f"> {latest_stats['threshold']:.1f} °C", "Hotspot Trigger")
+    st.markdown("---")
+
 # --- MULTI-LAYER OVERLAY LOGIC ---
 for layer in st.session_state.layers:
     folium.raster_layers.ImageOverlay(
         image=layer["image"],
         bounds=layer["bounds"],
-        opacity=0.7, # We will hook this up to the sidebar slider next!
+        opacity=layer_opacity,
         colormap=lambda x: (1, 0, 0, x),
         name=layer["name"]
     ).add_to(m)
@@ -81,7 +94,7 @@ if st.session_state.user_polygon:
     lats = [c[1] for c in coords]
     bbox = [min(lons), min(lats), max(lons), max(lats)]
     
-    st.write(f"Generated BBox: {bbox}")
+    #st.write(f"Generated BBox: {bbox}")
 
     # Connect to the Satellite Catalog
     catalog = pystac_client.Client.open(
@@ -90,7 +103,7 @@ if st.session_state.user_polygon:
     )
 
     # Search for Landsat Data
-    with st.spinner("Hunting for clear satellite passes..."):
+    with st.spinner("Querying Planetary Computer STAC API for cloud-free assets..."):
         search = catalog.search(
             collections=["landsat-c2-l2"],
             bbox=bbox,
@@ -100,12 +113,12 @@ if st.session_state.user_polygon:
         items = search.item_collection()
 
     if len(items) > 0:
-        st.success(f"Found {len(items)} clear satellite images for {target_year}!")
+        st.success(f"Successfully retrieved {len(items)} low-cloud satellite passes for {target_year}.")
         item_dates = [item.datetime.strftime("%Y-%m-%d") for item in items]
         selected_date = st.selectbox("Which date would you like to analyze?", item_dates)
         
         if st.button("Generate Interactive Heat Map 🌡️"):
-            with st.spinner("Reprojecting, clipping, and calculating... (Hands off the map!)"):
+            with st.spinner("Processing thermal bands & calculating Land Surface Temperature..."):
                 
                 selected_item = next(item for item in items if item.datetime.strftime("%Y-%m-%d") == selected_date)
                 thermal_url = selected_item.assets["lwir11"].href
@@ -125,12 +138,26 @@ if st.session_state.user_polygon:
                 # 5. Calculate Celsius ONLY on valid pixels
                 temp_celsius = (ds_valid * 0.00341802 + 149.0) - 273.15
                 
-                # 6. Generate colored image in memory
+                # --- THE STAT TRACKER & UHI MATH ---
+                # Get the exact stats for the polygon
+                mean_temp = float(temp_celsius.mean().item())
+                std_temp = float(temp_celsius.std().item())
+                max_temp = float(temp_celsius.max().item())
+                min_temp = float(temp_celsius.min().item())
+                
+                # Calculate the UHI Threshold (Mean + 0.5 Sigma)
+                uhi_threshold = mean_temp + (0.5 * std_temp)
+                
+                # ISOLATE HOTSPOTS: Erase everything below the threshold!
+                hotspots = temp_celsius.where(temp_celsius > uhi_threshold)
+                
+                # 6. Generate colored image in memory (Plotting ONLY the hotspots)
                 fig, ax = plt.subplots()
                 ax.set_axis_off()
                 fig.patch.set_alpha(0) 
                 
-                im = temp_celsius.plot(ax=ax, cmap="inferno", add_colorbar=False)
+                # Using 'Reds' or 'inferno' here looks incredible over the normal map
+                im = hotspots.plot(ax=ax, cmap="inferno", add_colorbar=False)
                 
                 img_buffer = io.BytesIO()
                 plt.savefig(img_buffer, format="png", bbox_inches='tight', pad_inches=0, transparent=True)
@@ -144,11 +171,17 @@ if st.session_state.user_polygon:
                 encoded_image = base64.b64encode(image_bytes).decode('utf-8')
                 data_url = f"data:image/png;base64,{encoded_image}"
                 
-                # 9. Save to the Multi-Layer Inventory
+                # 9. Save to the Multi-Layer Inventory WITH STATS!
                 new_layer = {
-                    "name": f"Heatmap ({selected_date})",
+                    "name": f"UHI Hotspots ({selected_date})",
                     "image": data_url,
-                    "bounds": folium_bounds
+                    "bounds": folium_bounds,
+                    "stats": {
+                        "max": max_temp,
+                        "min": min_temp,
+                        "mean": mean_temp,
+                        "threshold": uhi_threshold
+                    }
                 }
                 st.session_state.layers.append(new_layer)
                 
