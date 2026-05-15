@@ -5,3 +5,5 @@ pystac-client
 planetary-computer
 geopandas
 rioxarray
+matplotlib
+branca
