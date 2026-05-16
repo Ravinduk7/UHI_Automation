@@ -10,6 +10,8 @@ import branca.colormap as cm
 import io
 import base64
 import numpy as np
+import os
+import tempfile
 
 # --- UI SETUP ---
 st.set_page_config(page_title="Urban Heat Island Architect", layout="wide")
@@ -170,12 +172,28 @@ if st.session_state.user_polygon:
                 image_bytes = img_buffer.getvalue()
                 encoded_image = base64.b64encode(image_bytes).decode('utf-8')
                 data_url = f"data:image/png;base64,{encoded_image}"
+
+                # --- NEW: ENCODE THE GEOTIFF FOR DOWNLOAD ---
+                # rioxarray needs a physical file path, so we create a temporary hidden file
+                with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+                    temp_filepath = tmp.name
+                
+                # 1. Save the raster to the temporary physical file
+                temp_celsius.rio.to_raster(temp_filepath)
+                
+                # 2. Read the file back into our RAM as bytes for the Streamlit button
+                with open(temp_filepath, "rb") as file:
+                    tiff_bytes = file.read()
+                
+                # 3. Delete the temporary file instantly so we leave zero footprint
+                os.remove(temp_filepath)
                 
                 # 9. Save to the Multi-Layer Inventory WITH STATS!
                 new_layer = {
                     "name": f"UHI Hotspots ({selected_date})",
                     "image": data_url,
                     "bounds": folium_bounds,
+                    "tiff_bytes": tiff_bytes,
                     "stats": {
                         "max": max_temp,
                         "min": min_temp,
@@ -197,3 +215,34 @@ if st.session_state.user_polygon:
         st.error("No clear images found. Try a different year or area.")
 else:
     st.warning("Please draw a polygon on the map to start.")
+
+
+# --- EXPORT INTELLIGENCE HUB ---
+if st.session_state.layers:
+    st.divider()
+    st.subheader("📥 Export Geospatial Intelligence")
+    st.markdown("Download the raw spatial data for use in QGIS, ArcGIS, or other GIS software.")
+    
+    # 1. Create a list of the layer names
+    layer_names = [layer["name"] for layer in st.session_state.layers]
+    
+    # 2. Let the user select which one to download
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        selected_export_name = st.selectbox("Select Layer to Export:", layer_names)
+    
+    # 3. Find the matching layer data in the inventory
+    selected_layer = next(layer for layer in st.session_state.layers if layer["name"] == selected_export_name)
+    
+    # 4. Render the Download Button
+    with col2:
+        st.write("") # Spacing to align with the selectbox
+        st.write("") 
+        st.download_button(
+            label="Download GeoTIFF 🗺️",
+            data=selected_layer["tiff_bytes"],
+            file_name=f"{selected_export_name}.tif",
+            mime="image/tiff",
+            type="primary",
+            use_container_width=True
+        )
