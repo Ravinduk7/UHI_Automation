@@ -8,3 +8,6 @@ rioxarray
 matplotlib
 branca
 numpy
+contextily
+docxtpl
+shapely
