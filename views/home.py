@@ -29,11 +29,11 @@ with col1:
 with col2:
     with st.container(border=True):
         st.markdown("""
-        ### 🌾 Crop Monitor
-        **NDVI Tracker**
-        * **Sensor:** Sentinel-2 L2A
-        * **Output:** Vegetation Health & Soil Moisture
+        ### 🌊 Flood Risk Assessor
+        **SAR Inundation Pipeline**
+        * **Sensors:** GPM IMERG & Sentinel-1 RTC
+        * **Output:** Flood Probability Mapping
         * **Status:** 🟡 In Development
         """)
-        # 3. Use a disabled button as a placeholder so it doesn't crash!
+        # Still keeping the disabled button so it doesn't crash before we build the view!
         st.button("🚧 Coming Soon", disabled=True, use_container_width=True)
