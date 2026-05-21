@@ -11,3 +11,4 @@ numpy
 contextily
 docxtpl
 shapely
+scipy
