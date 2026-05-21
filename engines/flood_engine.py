@@ -247,7 +247,8 @@ def run_flood_pipeline(user_polygon, years_back=3):
         "heatmap_b64": heatmap_b64,
         "master_stats": {
             "total_risk_sqkm": round(total_risk_sqkm, 2),
-            "max_probability": int(probability_matrix.max())
+            "max_probability": int(probability_matrix.max()),
+            "analyzed_area_sqkm": round(area_sq_km, 2)
         },
         "individual_layers": individual_layers,
         "scans_used": successful_scans,

@@ -85,32 +85,7 @@ def render_flood_module():
                             st.rerun()
 
     # --- MAP HUD ---    
-    # --- STATS TRACKER TABLE ---
-    if st.session_state.flood_inventory:
-        st.subheader("📊 Flood Statistics Tracker")
-        
-        table_data = []
-        for item in st.session_state.flood_inventory:
-            area_id = f"Area {item['id']}"
-            res = item["result"]
-            
-            # Grab the total area analyzed from the master stats
-            analyzed_area = res.get('master_stats', {}).get('total_risk_sqkm', 'N/A')
-            
-            for tier_key, tier_data in res['individual_layers'].items():
-                rp = tier_data.get('return_period', tier_data.get('return_period_years', 'N/A'))
-                
-                table_data.append({
-                    "Area": area_id,
-                    "Analyzed Area (sq km)": analyzed_area,
-                    "Storm Tier": tier_key,
-                    "Date": tier_data["date"],
-                    "Rainfall (mm)": tier_data["rainfall_mm"],
-                    "Tier Flooded (sq km)": tier_data["flooded_sqkm"],
-                    "Return Period": f"1-in-{rp} yr" if rp != "N/A" else "N/A"
-                })
-                
-        st.dataframe(table_data, use_container_width=True, hide_index=True)
+    
     st.write("📍 **Step 1: Draw your Area of Interest (AOI) and hit Run.**")
 
     m = folium.Map(
@@ -190,5 +165,34 @@ def render_flood_module():
     if output and isinstance(output, dict):
         if output.get("last_active_drawing"):
             st.session_state.current_drawing = output["last_active_drawing"]["geometry"]
+    
+    # --- STATS TRACKER TABLE ---
+    if st.session_state.flood_inventory:
+        st.subheader("📊 Flood Statistics Tracker")
+        
+        table_data = []
+        for item in st.session_state.flood_inventory:
+            area_id = f"Area {item['id']}"
+            res = item["result"]
+            
+            # Grab BOTH correct stats!
+            analyzed_area = res.get('master_stats', {}).get('analyzed_area_sqkm', 'N/A')
+            total_risk = res.get('master_stats', {}).get('total_risk_sqkm', 'N/A')
+            
+            for tier_key, tier_data in res['individual_layers'].items():
+                rp = tier_data.get('return_period', tier_data.get('return_period_years', 'N/A'))
+                
+                table_data.append({
+                    "Area": area_id,
+                    "Box Area (sq km)": analyzed_area,
+                    "Compound Risk (sq km)": total_risk,
+                    "Storm Tier": tier_key,
+                    "Date": tier_data["date"],
+                    "Rainfall (mm)": tier_data["rainfall_mm"],
+                    "Tier Flooded (sq km)": tier_data["flooded_sqkm"],
+                    "Return Period": f"1-in-{rp} yr" if rp != "N/A" else "N/A"
+                })
+                
+        st.dataframe(table_data, use_container_width=True, hide_index=True)
 
 render_flood_module()
