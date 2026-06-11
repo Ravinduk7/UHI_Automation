@@ -145,3 +145,4 @@ if st.session_state.layers:
     
     with c2: st.write(""); st.write(""); st.download_button("Download GeoTIFF 🗺️", layer["tiff_bytes"], f"{selected_name}.tif", "image/tiff", use_container_width=True)
     with c3: st.write(""); st.write(""); st.download_button("Download Report 📄", report_bytes, f"Report_{layer['date']}.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
+    

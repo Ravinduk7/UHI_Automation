@@ -32,7 +32,7 @@ with col2:
         st.markdown("""
         ### 🌊 Flood Risk Assessor
         **SAR Inundation Pipeline**
-        * **Sensors:** GPM IMERG & Sentinel-1 RTC
+        * **Sensors:** Open-Meteo & Sentinel-1 RTC
         * **Output:** Probabilistic Flood Mapping
         * **Status:** 🟢 Online 
         """)

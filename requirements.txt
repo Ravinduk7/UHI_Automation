@@ -12,3 +12,5 @@ contextily
 docxtpl
 shapely
 scipy
+pillow
+pandas
