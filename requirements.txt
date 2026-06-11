@@ -17,4 +17,4 @@ shapely
 scipy
 pillow
 pandas
-dask[array]
+dask
