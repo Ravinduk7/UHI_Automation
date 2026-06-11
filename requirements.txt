@@ -5,6 +5,9 @@ pystac-client
 planetary-computer
 geopandas
 rioxarray
+rasterio
+pyproj
+rtree
 matplotlib
 branca
 numpy
@@ -14,3 +17,4 @@ shapely
 scipy
 pillow
 pandas
+dask[array]

@@ -5,22 +5,25 @@ import numpy as np
 import matplotlib.pyplot as plt
 import io
 import base64
+import gc  # Enforce manual garbage collection
 from datetime import datetime, timedelta
 import scipy.ndimage as ndimage
-from scipy.ndimage import uniform_filter, label
+from scipy.ndimage import uniform_filter
 from rasterio.io import MemoryFile
 from core.utils import process_user_polygon, get_dynamic_rain_events, export_to_tiff_bytes
 
 # Helper to quickly convert a generic array to a b64 PNG string
 def array_to_b64(arr, cmap='viridis', vmin=None, vmax=None):
-    fig, ax = plt.subplots(figsize=(8, 8))
+    fig, ax = plt.subplots(figsize=(6, 6)) # Downsized canvas for server performance
     ax.set_axis_off()
     fig.patch.set_alpha(0)
     ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax)
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight', pad_inches=0, transparent=True)
+    fig.savefig(buf, format='png', bbox_inches='tight', pad_inches=0, transparent=True, dpi=100)
     plt.close(fig)
-    return base64.b64encode(buf.getvalue()).decode('utf-8')
+    b64_str = base64.b64encode(buf.getvalue()).decode('utf-8')
+    del buf, fig, ax
+    return b64_str
 
 def fetch_sar_image(catalog, bbox, target_date_str, is_baseline=False):
     target_date = datetime.strptime(target_date_str, "%Y-%m-%d")
@@ -48,9 +51,11 @@ def fetch_sar_image(catalog, bbox, target_date_str, is_baseline=False):
     asset_href = items[0].assets["vv"].href
     
     try:
-        rds = rioxarray.open_rasterio(asset_href)
+        # Optimization: chunking limits memory footprint during load
+        rds = rioxarray.open_rasterio(asset_href, chunks={"x": 512, "y": 512})
         clipped = rds.rio.clip_box(*bbox, crs="EPSG:4326")
-        array = clipped.squeeze().values
+        array = clipped.squeeze().values.astype(np.float32) # Force Float32 instead of default Float64
+        rds.close()
         return array, clipped
     except Exception as e:
         print(f"  [!] RIOXARRAY CRASH: {e}")
@@ -68,12 +73,14 @@ def fetch_terrain_mask(catalog, bbox, sar_spatial_reference):
     try:
         dem_rds = rioxarray.open_rasterio(items[0].assets["data"].href)
         dem_matched = dem_rds.rio.reproject_match(sar_spatial_reference)
-        elevation = dem_matched.squeeze().values
+        elevation = dem_matched.squeeze().values.astype(np.float32)
+        dem_rds.close()
         
-        dy, dx = np.gradient(elevation, 10, 10)  # 10m SAR pixel resolution
-        slope = np.degrees(np.arctan(np.sqrt(dx**2 + dy**2)))
+        dy, dx = np.gradient(elevation, 10, 10)
+        slope = np.degrees(np.arctan(np.sqrt(dx**2 + dy**2))).astype(np.float32)
         
         valid_terrain = (elevation > 0) & (slope < 5)
+        del dy, dx, slope
         return valid_terrain, elevation
     except Exception as e:
         print(f"  [!] DEM Error: {e}")
@@ -81,7 +88,6 @@ def fetch_terrain_mask(catalog, bbox, sar_spatial_reference):
     
 def fetch_environmental_mask(catalog, bbox, sar_spatial_reference):
     print("🌍 Fetching JRC Permanent Water & ESA WorldCover masks...")
-
     valid_env_mask = None
     wc_array = None
     jrc_array_raw = None 
@@ -93,7 +99,8 @@ def fetch_environmental_mask(catalog, bbox, sar_spatial_reference):
         if jrc_items:
             jrc_rds = rioxarray.open_rasterio(jrc_items[0].assets["occurrence"].href)
             jrc_matched = jrc_rds.rio.reproject_match(sar_spatial_reference)
-            jrc_array_raw = jrc_matched.squeeze().values 
+            jrc_array_raw = jrc_matched.squeeze().values.astype(np.uint8) # Explicitly cast to space-saving Uint8
+            jrc_rds.close()
             
             valid_jrc = jrc_array_raw < 80
             valid_env_mask = valid_jrc
@@ -108,9 +115,9 @@ def fetch_environmental_mask(catalog, bbox, sar_spatial_reference):
         if wc_items:
             wc_rds = rioxarray.open_rasterio(wc_items[0].assets["map"].href)
             wc_matched = wc_rds.rio.reproject_match(sar_spatial_reference)
-            wc_array = wc_matched.squeeze().values
+            wc_array = wc_matched.squeeze().values.astype(np.uint8) # Cast to Uint8
+            wc_rds.close()
             
-            # FIXED: explicitly whitelist valid landcover codes to prevent nuking the map
             valid_wc = np.isin(wc_array, [10, 20, 30, 40, 50, 60, 70])
             
             if valid_env_mask is not None:
@@ -140,15 +147,13 @@ def run_flood_pipeline(user_polygon, years_back=3):
     
     print("📡 Scouting historical rain events...")
     try:
-        # Ensure we are getting the variables expected
         peak_dates_list, baseline_candidates, storm_metadata = get_dynamic_rain_events(center_lat, center_lon, years_back)
     except Exception as e:
         return {"error": f"IMERG Error: {e}"}
         
-    # Safety checks
     if not peak_dates_list:
         return {"error": "No extreme rainfall events found here. Try increasing the historical window."}
-    # Rename for clarity to avoid confusion with loop variables
+        
     peak_dates = peak_dates_list
     if not baseline_candidates:
         return {"error": "Could not establish any dry periods under 10mm for this region."}
@@ -169,31 +174,37 @@ def run_flood_pipeline(user_polygon, years_back=3):
         return {"error": "Sentinel-1 did not capture a baseline image during ANY of the 5 tested dry periods."}
         
     dry_array_filtered = uniform_filter(dry_array, size=3)
-    dry_db = 10 * np.log10(np.clip(dry_array_filtered, 1e-10, None))
+    del dry_array # Free large un-filtered array immediately
+    
+    dry_db = (10 * np.log10(np.clip(dry_array_filtered, 1e-10, None))).astype(np.float32)
+    del dry_array_filtered
     
     terrain_mask, elevation = fetch_terrain_mask(catalog, bbox, dry_spatial_ref)
     env_mask, wc_array, jrc_array = fetch_environmental_mask(catalog, bbox, dry_spatial_ref)
 
     mask_b64 = None
     if env_mask is not None:
-        fig_mask, ax_mask = plt.subplots(figsize=(8, 8))
+        fig_mask, ax_mask = plt.subplots(figsize=(6, 6))
         ax_mask.set_axis_off()
         fig_mask.patch.set_alpha(0)
         cmap_mask = plt.cm.Wistia 
         cmap_mask.set_under('none')
-        ax_mask.imshow((~env_mask).astype(int) * 100, cmap=cmap_mask, vmin=1, vmax=100, alpha=0.6)
+        ax_mask.imshow((~env_mask).astype(np.uint8) * 100, cmap=cmap_mask, vmin=1, vmax=100, alpha=0.6)
         
         buf_mask = io.BytesIO()
-        fig_mask.savefig(buf_mask, format='png', bbox_inches='tight', pad_inches=0, transparent=True)
+        fig_mask.savefig(buf_mask, format='png', bbox_inches='tight', pad_inches=0, transparent=True, dpi=100)
         plt.close(fig_mask)
         mask_b64 = base64.b64encode(buf_mask.getvalue()).decode('utf-8')
+        del buf_mask, fig_mask, ax_mask
+        gc.collect()
 
-    flood_hits = np.zeros_like(dry_array, dtype=float)
+    # Cast baseline tracking layers to space-efficient types
+    flood_hits = np.zeros_like(dry_db, dtype=np.float32)
     total_weight = 0.0
     successful_scans = 0
     actual_dates_used = [] 
     individual_layers = {} 
-    min_rainfall_to_flood = np.full(dry_array.shape, np.inf)
+    min_rainfall_to_flood = np.full(dry_db.shape, np.inf, dtype=np.float32)
 
     def label_tier(rp):
         try:
@@ -205,34 +216,35 @@ def run_flood_pipeline(user_polygon, years_back=3):
         except: return "Standard Event"
 
     def get_lc_sqkm(wc, code, flood_mask):
-        if wc is None:
-            return "N/A"
+        if wc is None: return "N/A"
         return round(((wc == code) & flood_mask).sum() * 100 / 1e6, 2)
         
-    # Use a different variable name for the inner loop to avoid clobbering
     for tier_idx, current_tier_dates in enumerate(peak_dates):
         print(f"\n🌊 Processing Severity Tier {tier_idx + 1}...")
         tier_success = False
         
-        # Iterate over the dates in this specific tier
         for date_str in current_tier_dates:
             print(f"  -> Testing storm on {date_str}...")
             wet_array, wet_spatial = fetch_sar_image(catalog, bbox, date_str) 
             
             if wet_array is not None:
-                if wet_array.shape != dry_array.shape:
+                if wet_array.shape != dry_db.shape:
                     print(f"  [!] Shape mismatch. Forcing alignment...")
                     try:
                         wet_matched = wet_spatial.rio.reproject_match(dry_spatial_ref)
-                        wet_array = wet_matched.squeeze().values
+                        wet_array = wet_matched.squeeze().values.astype(np.float32)
+                        wet_matched.close()
                     except Exception as e:
                         print(f"  [!] Realignment failed: {e}. Skipping backup.")
                         continue
                     
                 wet_array_filtered = uniform_filter(wet_array, size=3)
-                wet_db = 10 * np.log10(np.clip(wet_array_filtered, 1e-10, None))
+                del wet_array # Evict raw frame
                 
-                dynamic_threshold = np.full(wet_db.shape, -14.0)
+                wet_db = (10 * np.log10(np.clip(wet_array_filtered, 1e-10, None))).astype(np.float32)
+                del wet_array_filtered
+                
+                dynamic_threshold = np.full(wet_db.shape, -14.0, dtype=np.float32)
                 if wc_array is not None:
                     dynamic_threshold[wc_array == 10] = -12.0  
                     dynamic_threshold[wc_array == 20] = -13.0  
@@ -240,9 +252,14 @@ def run_flood_pipeline(user_polygon, years_back=3):
                     dynamic_threshold[wc_array == 60] = -16.0  
                 
                 raw_flood = (wet_db < dynamic_threshold) & ((wet_db - dry_db) < -2.5)
+                del dynamic_threshold, wet_db # Burn tracking layers
+                
                 filled_flood = ndimage.binary_dilation(raw_flood, iterations=2)
+                del raw_flood
                 
                 is_flooded = filled_flood.copy()
+                del filled_flood
+                
                 if terrain_mask is not None:
                     is_flooded = is_flooded & terrain_mask
                 if env_mask is not None:
@@ -253,17 +270,21 @@ def run_flood_pipeline(user_polygon, years_back=3):
                 too_small = component_sizes < 5
                 too_small[0] = False  
                 is_flooded = is_flooded & ~too_small[labeled]
+                del labeled, component_sizes, too_small
 
-                fig_tier, ax_tier = plt.subplots(figsize=(8, 8))
+                # Memory leak patch: downscale preview canvas & instantly destroy plot variables
+                fig_tier, ax_tier = plt.subplots(figsize=(6, 6))
                 ax_tier.set_axis_off()
                 fig_tier.patch.set_alpha(0)
                 cmap_tier = plt.cm.Reds 
                 cmap_tier.set_under('none')
                 
-                ax_tier.imshow(is_flooded.astype(int) * 100, cmap=cmap_tier, vmin=1, vmax=100)
+                ax_tier.imshow(is_flooded.astype(np.uint8) * 100, cmap=cmap_tier, vmin=1, vmax=100)
                 buf_tier = io.BytesIO()
-                fig_tier.savefig(buf_tier, format='png', bbox_inches='tight', pad_inches=0, transparent=True)
+                fig_tier.savefig(buf_tier, format='png', bbox_inches='tight', pad_inches=0, transparent=True, dpi=100)
                 plt.close(fig_tier)
+                tier_b64 = base64.b64encode(buf_tier.getvalue()).decode('utf-8')
+                del buf_tier, fig_tier, ax_tier
                 
                 flooded_pixels = is_flooded.sum()
                 flooded_sqkm = (flooded_pixels * 100) / 1_000_000
@@ -273,7 +294,7 @@ def run_flood_pipeline(user_polygon, years_back=3):
 
                 individual_layers[f"Tier_{tier_idx + 1}"] = {
                     "date": date_str,
-                    "image_b64": base64.b64encode(buf_tier.getvalue()).decode('utf-8'),
+                    "image_b64": tier_b64,
                     "tiff_bytes": export_to_tiff_bytes(is_flooded, dry_spatial_ref), 
                     "flooded_sqkm": round(flooded_sqkm, 2),
                     "rainfall_mm": current_rain,
@@ -293,28 +314,32 @@ def run_flood_pipeline(user_polygon, years_back=3):
                     rp = years_back
                 
                 annual_weight = min(1.0 / rp, 1.0)  
-                flood_hits += is_flooded.astype(float) * annual_weight
+                flood_hits += is_flooded.astype(np.float32) * annual_weight
                 total_weight += annual_weight
 
                 successful_scans += 1
                 actual_dates_used.append(date_str)
                 tier_success = True
+                del is_flooded
                 print(f"  ✅ Success! Locked in Tier {tier_idx + 1} storm.")
                 break 
                 
         if not tier_success:
             print(f"  ❌ Failed to find any SAR images for Tier {tier_idx + 1}.")
+        gc.collect() # Garbage collection sweep after every tier iteration
             
+    del dry_db # No longer needed after loop closes
     if successful_scans == 0:
         return {"error": "Found rain events, but no Sentinel-1 satellite passes matched any of the backups."}
 
     if total_weight > 0:
-        susceptibility_matrix = (flood_hits / total_weight) * 100
+        susceptibility_matrix = ((flood_hits / total_weight) * 100).astype(np.float32)
     else:
-        susceptibility_matrix = (flood_hits / max(1, successful_scans)) * 100
+        susceptibility_matrix = ((flood_hits / max(1, successful_scans)) * 100).astype(np.float32)
+    del flood_hits
 
     print("\n🎨 Generating Master UI overlay...")
-    fig, ax = plt.subplots(figsize=(8, 8))
+    fig, ax = plt.subplots(figsize=(6, 6))
     ax.set_axis_off()
     fig.patch.set_alpha(0) 
     cmap = plt.cm.Blues
@@ -322,9 +347,10 @@ def run_flood_pipeline(user_polygon, years_back=3):
     ax.imshow(susceptibility_matrix, cmap=cmap, vmin=1, vmax=100)
     
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight', pad_inches=0, transparent=True)
+    fig.savefig(buf, format='png', bbox_inches='tight', pad_inches=0, transparent=True, dpi=100)
     plt.close(fig)
     heatmap_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    del buf, fig, ax
     
     risk_threshold = 30
     risk_pixels = (susceptibility_matrix >= risk_threshold).sum()
@@ -334,8 +360,6 @@ def run_flood_pipeline(user_polygon, years_back=3):
     jrc_tiff = export_to_tiff_bytes(jrc_array, dry_spatial_ref) if jrc_array is not None else None
     wc_tiff = export_to_tiff_bytes(wc_array, dry_spatial_ref) if wc_array is not None else None
 
-    
-
     def sum_lc(key):
         total = 0
         for layer in individual_layers.values():
@@ -344,44 +368,56 @@ def run_flood_pipeline(user_polygon, years_back=3):
                 total += val
         return round(total, 2)
     
-    min_rainfall_clean = np.where(np.isinf(min_rainfall_to_flood), 0, min_rainfall_to_flood)
+    min_rainfall_clean = np.where(np.isinf(min_rainfall_to_flood), 0, min_rainfall_to_flood).astype(np.float32)
+    del min_rainfall_to_flood
     min_rainfall_tiff = export_to_tiff_bytes(min_rainfall_clean, dry_spatial_ref)
+    del min_rainfall_clean
 
-    # 🗺️ Generating the 4-Panel Context Map ONCE to save memory
-    print("\n🗺️ Generating 4-Panel Context Map...")
-    fig_4p, axs = plt.subplots(2, 2, figsize=(10, 10))
-    
-    if elevation is not None:
-        axs[0, 0].imshow(elevation, cmap='terrain')
-    axs[0, 0].set_title("Elevation (DEM)")
-    axs[0, 0].axis('off')
-    
-    if wc_array is not None:
-        axs[0, 1].imshow(wc_array, cmap='tab20')
-    axs[0, 1].set_title("ESA WorldCover")
-    axs[0, 1].axis('off')
-    
-    if jrc_array is not None:
-        axs[1, 0].imshow(jrc_array, cmap='Blues', vmin=0, vmax=100)
-    axs[1, 0].set_title("JRC Permanent Water")
-    axs[1, 0].axis('off')
-    
-    axs[1, 1].imshow(susceptibility_matrix, cmap='Reds', vmin=1, vmax=100)
-    axs[1, 1].set_title("Master Flood Susceptibility")
-    axs[1, 1].axis('off')
-    
-    plt.tight_layout()
-    buf_4p = io.BytesIO()
-    fig_4p.savefig(buf_4p, format='png', bbox_inches='tight', transparent=True)
-    plt.close(fig_4p)
-    four_panel_b64 = base64.b64encode(buf_4p.getvalue()).decode('utf-8')
-
-    # Now generate the visuals
+    # 🗺️ Unified visual collection: Generate specific b64s from the matrices FIRST
     visual_previews = {
         "jrc_map": array_to_b64(jrc_array, 'Blues', 0, 100) if jrc_array is not None else None,
         "wc_map": array_to_b64(wc_array, 'tab20') if wc_array is not None else None,
         "dem_map": array_to_b64(elevation, 'terrain') if elevation is not None else None
     }
+
+    # Now build the 4-panel map without intersecting secondary function execution footprints
+    print("\n🗺️ Generating 4-Panel Context Map...")
+    fig_4p, axs = plt.subplots(2, 2, figsize=(8, 8))
+    
+    if elevation is not None:
+        axs[0, 0].imshow(elevation, cmap='terrain')
+    axs[0, 0].set_title("Elevation (DEM)", fontsize=10)
+    axs[0, 0].axis('off')
+    
+    if wc_array is not None:
+        axs[0, 1].imshow(wc_array, cmap='tab20')
+    axs[0, 1].set_title("ESA WorldCover", fontsize=10)
+    axs[0, 1].axis('off')
+    
+    if jrc_array is not None:
+        axs[1, 0].imshow(jrc_array, cmap='Blues', vmin=0, vmax=100)
+    axs[1, 0].set_title("JRC Permanent Water", fontsize=10)
+    axs[1, 0].axis('off')
+    
+    axs[1, 1].imshow(susceptibility_matrix, cmap='Reds', vmin=1, vmax=100)
+    axs[1, 1].set_title("Master Flood Susceptibility", fontsize=10)
+    axs[1, 1].axis('off')
+    
+    plt.tight_layout()
+    buf_4p = io.BytesIO()
+    fig_4p.savefig(buf_4p, format='png', bbox_inches='tight', transparent=True, dpi=100)
+    plt.close(fig_4p)
+    four_panel_b64 = base64.b64encode(buf_4p.getvalue()).decode('utf-8')
+    del buf_4p, fig_4p, axs
+
+    # Compile baseline statistics before cleaning core layers
+    mean_elev = "N/A"
+    if elevation is not None and np.any(elevation > 0):
+        mean_elev = round(float(np.mean(elevation[elevation > 0])), 1)
+
+    # Burn final arrays out of memory scope
+    del elevation, wc_array, jrc_array, susceptibility_matrix
+    gc.collect()
 
     return {
         "success": True,
@@ -390,7 +426,6 @@ def run_flood_pipeline(user_polygon, years_back=3):
         "four_panel_map_b64": four_panel_b64,
         "master_stats": {
             "high_susceptibility_sqkm": round(high_susceptibility_sqkm, 2),
-            "max_susceptibility_score": int(susceptibility_matrix.max()),
             "selected_area_sqkm": round(area_sq_km, 2),
             "baseline_date": locked_baseline_date, 
             "center_lat": round(center_lat, 4),
@@ -398,10 +433,7 @@ def run_flood_pipeline(user_polygon, years_back=3):
             "cropland_total_sqkm": sum_lc("cropland_sqkm"),
             "urban_total_sqkm": sum_lc("urban_sqkm"),
             "forest_total_sqkm": sum_lc("forest_sqkm"),
-            "mean_elevation_m": (
-                round(float(np.mean(elevation[elevation > 0])), 1)
-                if elevation is not None and np.any(elevation > 0) else "N/A"
-            ),
+            "mean_elevation_m": mean_elev,
             "confidence_score": round((successful_scans / len(peak_dates)) * 100, 1) 
         },
         "individual_layers": individual_layers,
