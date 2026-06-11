@@ -40,7 +40,7 @@ def render_flood_module():
         st.divider()
 
         # The Cleaned-Up Generate Button
-        if st.button("🚀 Run Risk Assessment", type="primary", use_container_width=True):
+        if st.button("🚀 Run Risk Assessment", type="primary", width="stretch"):
             if st.session_state.current_drawing is not None:
                 with st.spinner("Scouting historical storms & fetching radar... (Takes 30-60s)"):
                     result = run_flood_pipeline(st.session_state.current_drawing, years_back)
@@ -220,7 +220,7 @@ def render_flood_module():
                     "Return Period": f"1-in-{rp} yr" if rp != "N/A" else "N/A"
                 })
                 
-        st.dataframe(table_data, use_container_width=True, hide_index=True)
+        st.dataframe(table_data, width="stretch", hide_index=True)
 
         # --- EXTRACT TARGETED DATA (ZIP DOWNLOADER) ---
         st.divider()
